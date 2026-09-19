@@ -91,3 +91,255 @@ class NormalizedSourcePredictionLoss(nn.Module):
         summed = (frame_loss * valid_mask).sum(dim=(1, 2))
         counts = valid_mask.sum(dim=(1, 2)).clamp_min(1)
         return summed / counts
+
+
+# ---------------------------------------------------------------------------
+# JEPA v2: Mamba sequence blocks, contextual EMA targets and masked prediction
+# ---------------------------------------------------------------------------
+
+import copy
+import math
+import warnings
+
+try:
+    from mamba_ssm import Mamba as _MambaSSM
+except ImportError:  # pragma: no cover - depends on the CUDA extension
+    _MambaSSM = None
+
+
+class _TorchSelectiveSSM(nn.Module):
+    """Slow reference selective SSM used only when ``mamba_ssm`` is missing.
+
+    It follows the Mamba block layout (in-proj, depthwise conv, selective scan,
+    gated out-proj) with a sequential scan, so it is suitable for smoke tests
+    on CPU but not for real training.
+    """
+
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        d_inner = expand * d_model
+        self.d_state = d_state
+        self.dt_rank = math.ceil(d_model / 16)
+        self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
+        self.conv1d = nn.Conv1d(
+            d_inner, d_inner, d_conv, groups=d_inner, padding=d_conv - 1
+        )
+        self.x_proj = nn.Linear(d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, d_inner)
+        a = torch.arange(1, d_state + 1).float().repeat(d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(a))
+        self.D = nn.Parameter(torch.ones(d_inner))
+        self.out_proj = nn.Linear(d_inner, d_model, bias=False)
+
+    def forward(self, x):
+        length = x.shape[1]
+        x, z = self.in_proj(x).chunk(2, dim=-1)
+        x = F.silu(self.conv1d(x.transpose(1, 2))[..., :length].transpose(1, 2))
+        dt, b, c = self.x_proj(x).split(
+            [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        dt = F.softplus(self.dt_proj(dt))
+        a = -torch.exp(self.A_log.float())
+        state = x.new_zeros(x.shape[0], x.shape[2], self.d_state)
+        outputs = []
+        for t in range(length):
+            decay = torch.exp(dt[:, t, :, None] * a)
+            state = decay * state + (dt[:, t, :, None] * b[:, t, None, :]) * x[
+                :, t, :, None
+            ]
+            outputs.append((state * c[:, t, None, :]).sum(-1))
+        y = torch.stack(outputs, dim=1) + x * self.D
+        return self.out_proj(y * F.silu(z))
+
+
+def _make_mamba(d_model, d_state, d_conv, expand):
+    if _MambaSSM is not None:
+        return _MambaSSM(
+            d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand
+        )
+    warnings.warn(
+        "mamba_ssm not installed: using the slow PyTorch reference scan"
+    )
+    return _TorchSelectiveSSM(d_model, d_state, d_conv, expand)
+
+
+class BiMambaLayer(nn.Module):
+    """Pre-norm bidirectional Mamba layer with a feed-forward sublayer."""
+
+    def __init__(self, d_model, d_ffn, d_state=16, d_conv=4, expand=2,
+                 causal=False):
+        super().__init__()
+        self.causal = causal
+        self.norm1 = nn.LayerNorm(d_model)
+        self.forward_ssm = _make_mamba(d_model, d_state, d_conv, expand)
+        self.backward_ssm = (
+            None if causal else _make_mamba(d_model, d_state, d_conv, expand)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ffn), nn.GELU(), nn.Linear(d_ffn, d_model)
+        )
+
+    def forward(self, x):
+        h = self.norm1(x)
+        y = self.forward_ssm(h)
+        if self.backward_ssm is not None:
+            y = y + self.backward_ssm(h.flip(1)).flip(1)
+        x = x + y
+        return x + self.ffn(self.norm2(x))
+
+
+class BiMambaBlock(nn.Module):
+    """Drop-in replacement for ``SBTransformerBlock`` ([B, L, N] -> same)."""
+
+    def __init__(self, num_layers, d_model, d_ffn, d_state=16, d_conv=4,
+                 expand=2, causal=False):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            BiMambaLayer(d_model, d_ffn, d_state, d_conv, expand, causal)
+            for _ in range(num_layers)
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+
+
+class SequenceContextEncoder(nn.Module):
+    """Contextualize per-source latents ``[N, C, T]`` with a sequence model.
+
+    The same module is used by the online branch (separated, span-masked
+    latents) and, as an EMA copy, by the target branch (clean sources), so
+    JEPA targets carry temporal context instead of raw filterbank features.
+    """
+
+    def __init__(self, sequence_model):
+        super().__init__()
+        self.sequence_model = sequence_model
+
+    def forward(self, latents):
+        return self.sequence_model(latents.transpose(1, 2)).transpose(1, 2)
+
+
+class MaskedSpanPredictor(nn.Module):
+    """Narrow predictor that infers target embeddings at masked frames.
+
+    Unlike ``SourceLatentPredictor`` it sees temporal context, so the loss on
+    masked spans can only be minimized by predicting, not by copying.
+    """
+
+    def __init__(self, channels, predictor_dim, sequence_model):
+        super().__init__()
+        self.mask_token = nn.Parameter(torch.zeros(1, predictor_dim, 1))
+        self.input_proj = nn.Conv1d(channels, predictor_dim, 1)
+        self.sequence_model = sequence_model
+        self.output_proj = nn.Conv1d(predictor_dim, channels, 1)
+        nn.init.normal_(self.mask_token, std=0.02)
+
+    def forward(self, context, frame_mask):
+        """``context`` [N, C, T]; ``frame_mask`` [N, T] (True = masked)."""
+        h = self.input_proj(context)
+        mask = frame_mask.unsqueeze(1).to(h.dtype)
+        h = h * (1 - mask) + self.mask_token.to(h.dtype) * mask
+        h = self.sequence_model(h.transpose(1, 2)).transpose(1, 2)
+        return self.output_proj(h)
+
+
+def sample_span_mask(batch, frames, mask_ratio, span, device):
+    """Sample block masks covering about ``mask_ratio`` of ``frames``."""
+    if mask_ratio <= 0:
+        return torch.zeros(batch, frames, dtype=torch.bool, device=device)
+    span = max(1, min(span, frames))
+    num_spans = max(1, int(round(mask_ratio * frames / span)))
+    starts = torch.randint(
+        0, max(1, frames - span + 1), (batch, num_spans), device=device
+    )
+    offsets = torch.arange(span, device=device)
+    index = (starts.unsqueeze(-1) + offsets).reshape(batch, -1)
+    mask = torch.zeros(batch, frames, dtype=torch.bool, device=device)
+    mask.scatter_(1, index, True)
+    return mask
+
+
+def ema_momentum(step, total_steps, start, end=1.0):
+    """Cosine momentum schedule from ``start`` to ``end`` (I-JEPA/BYOL)."""
+    if total_steps <= 0:
+        return start
+    progress = min(1.0, step / total_steps)
+    return end - (end - start) * (math.cos(math.pi * progress) + 1) / 2
+
+
+class MaskedLatentPredictionLoss(nn.Module):
+    """Loss on masked frames between predictions and layer-normed targets.
+
+    ``kind='l2'`` follows I-JEPA (MSE to LayerNorm-ed targets);
+    ``kind='cosine'`` reuses the v1 frame-wise cosine distance.
+    """
+
+    def __init__(self, kind="l2", eps=1e-4):
+        super().__init__()
+        if kind not in ("l2", "cosine"):
+            raise ValueError("kind must be 'l2' or 'cosine'")
+        self.kind = kind
+        self.eps = eps
+
+    def forward(self, predictions, targets, weight_mask):
+        """Shapes ``[B, S, C, T]`` and ``weight_mask`` ``[B, S, T]``."""
+        predictions = predictions.float()
+        targets = targets.detach().float()
+        if self.kind == "l2":
+            targets = F.layer_norm(targets.transpose(2, 3), (targets.shape[2],))
+            targets = targets.transpose(2, 3)
+            frame_loss = (predictions - targets).pow(2).mean(dim=2)
+        else:
+            frame_loss = 1.0 - (
+                F.normalize(predictions, dim=2, eps=self.eps)
+                * F.normalize(targets, dim=2, eps=self.eps)
+            ).sum(dim=2)
+        weight_mask = weight_mask.float()
+        summed = (frame_loss * weight_mask).sum(dim=(1, 2))
+        return summed / weight_mask.sum(dim=(1, 2)).clamp_min(1)
+
+
+@torch.no_grad()
+def embedding_health(embeddings, max_frames=4096):
+    """Collapse monitors: mean per-channel std and effective rank.
+
+    ``embeddings`` is ``[..., C, T]``; returns python floats.
+    """
+    x = embeddings.detach().float().transpose(-1, -2).reshape(
+        -1, embeddings.shape[-2]
+    )
+    if x.shape[0] > max_frames:
+        x = x[torch.randperm(x.shape[0], device=x.device)[:max_frames]]
+    x = F.layer_norm(x, (x.shape[-1],))
+    std = x.std(dim=0).mean().item()
+    singular = torch.linalg.svdvals(x - x.mean(0))
+    p = singular / singular.sum().clamp_min(1e-12)
+    rank = torch.exp(-(p * torch.log(p.clamp_min(1e-12))).sum()).item()
+    return std, rank
+
+
+def build_sequence_model(kind, num_layers, d_model, d_ffn, nhead=8,
+                         d_state=16, causal=False):
+    """Build a ``[B, L, N]`` sequence model: ``'transformer'`` or ``'mamba'``."""
+    if kind == "mamba":
+        return BiMambaBlock(num_layers, d_model, d_ffn, d_state=d_state,
+                            causal=causal)
+    if kind == "transformer":
+        from speechbrain.lobes.models.dual_path import SBTransformerBlock
+
+        return SBTransformerBlock(
+            num_layers=num_layers, d_model=d_model, nhead=nhead, d_ffn=d_ffn,
+            dropout=0, use_positional_encoding=True, norm_before=True,
+        )
+    raise ValueError(f"unknown sequence model kind: {kind}")
+
+
+def make_ema_copy(module):
+    """Frozen deep copy used as an EMA target network."""
+    target = copy.deepcopy(module)
+    target.requires_grad_(False)
+    return target.eval()
