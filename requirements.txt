@@ -1,0 +1,13 @@
+# Tested: python 3.10, torch/torchaudio 2.5.1+cu124, V100 32GB
+torch==2.5.1
+torchaudio==2.5.1
+speechbrain==1.0.3
+hyperpyyaml
+ruamel.yaml<0.19
+mamba-ssm==2.2.4  # optional: needed for --seq_model=mamba (CUDA build)
+causal-conv1d>=1.4
+mir_eval
+soundfile
+pandas
+scipy
+tqdm

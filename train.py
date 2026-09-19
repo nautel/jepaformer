@@ -16,7 +16,10 @@ from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SPEECHBRAIN_ROOT = Path(
-    os.environ.get("SPEECHBRAIN_ROOT", PROJECT_ROOT / "speechbrain")
+    os.environ.get(
+        "SPEECHBRAIN_ROOT",
+        Path(__file__).resolve().parent / "third_party" / "speechbrain",
+    )
 )
 BASE_RECIPE_DIR = SPEECHBRAIN_ROOT / "recipes" / "LibriMix" / "separation"
 
