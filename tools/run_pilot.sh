@@ -18,4 +18,4 @@ exec nice -n 10 ionice -c3 "$HOME/envs/jepa2/bin/python" train.py hparams/jepa2-
   --train_data="$CSV/libri2mix_train-100.csv" --valid_data="$CSV/libri2mix_dev.csv" \
   --test_data="$CSV/libri2mix_test.csv" --skip_prep=True \
   --N_epochs="$EPOCHS" --batch_size="$BS" --training_signal_len=32000 \
-  --ema_anneal_steps=$(( EPOCHS * STEPS_PER_EPOCH )) --noprogressbar=True "$@"
+  --ema_anneal_steps=$(( EPOCHS * STEPS_PER_EPOCH )) --noprogressbar "$@"
