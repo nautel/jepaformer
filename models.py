@@ -322,6 +322,41 @@ def embedding_health(embeddings, max_frames=4096):
     return std, rank
 
 
+class _CausalConv1dLegacyAPI:
+    """Old ``causal_conv1d_cuda`` signatures on top of causal-conv1d >= 1.4.
+
+    Mamba-TasNet calls ``fwd(x, w, b, seq_idx, silu)`` and
+    ``bwd(x, w, b, dout, seq_idx, dx, silu)``; newer builds add
+    initial/final-state arguments.
+    """
+
+    def __init__(self, cuda_module):
+        self._cuda = cuda_module
+
+    def causal_conv1d_fwd(self, x, weight, bias, seq_idx, silu):
+        return self._cuda.causal_conv1d_fwd(
+            x, weight, bias, seq_idx, None, None, silu
+        )
+
+    def causal_conv1d_bwd(self, x, weight, bias, dout, seq_idx, dx, silu):
+        dx, dweight, dbias, *_ = self._cuda.causal_conv1d_bwd(
+            x, weight, bias, dout, seq_idx, None, None, dx, False, silu
+        )
+        return dx, dweight, dbias
+
+
+def _patch_causal_conv1d_api():
+    from importlib.metadata import version
+
+    from modules.mamba import selective_scan_interface as ssi
+
+    major, minor = (int(v) for v in version("causal-conv1d").split(".")[:2])
+    if (major, minor) >= (1, 4) and not isinstance(
+        ssi.causal_conv1d_cuda, _CausalConv1dLegacyAPI
+    ):
+        ssi.causal_conv1d_cuda = _CausalConv1dLegacyAPI(ssi.causal_conv1d_cuda)
+
+
 def _official_dpmamba_block(num_layers, d_model, d_state):
     """Official DPMamba intra/inter block from github.com/xi-j/Mamba-TasNet.
 
@@ -357,6 +392,8 @@ def _official_dpmamba_block(num_layers, d_model, d_state):
 
         sys.modules["mamba_ssm.ops.triton.layernorm"] = _layer_norm
     from modules.mamba_blocks import MambaBlocksSequential
+
+    _patch_causal_conv1d_api()
 
     return MambaBlocksSequential(
         n_mamba=num_layers,
