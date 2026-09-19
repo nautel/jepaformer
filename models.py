@@ -347,6 +347,15 @@ def _official_dpmamba_block(num_layers, d_model, d_state):
         )
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
+    # Mamba-TasNet imports ``mamba_ssm.ops.triton.layernorm`` (mamba-ssm 1.x);
+    # mamba-ssm 2.x renamed it to ``layer_norm``. Alias it, otherwise RMSNorm
+    # silently becomes None.
+    try:
+        import mamba_ssm.ops.triton.layernorm  # noqa: F401
+    except ImportError:
+        import mamba_ssm.ops.triton.layer_norm as _layer_norm
+
+        sys.modules["mamba_ssm.ops.triton.layernorm"] = _layer_norm
     from modules.mamba_blocks import MambaBlocksSequential
 
     return MambaBlocksSequential(
