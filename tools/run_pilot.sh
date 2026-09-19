@@ -5,7 +5,7 @@
 set -euo pipefail
 GPU=$1; SEQ=$2; MODE=$3; shift 3
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-CSV=${CSV_DIR:?set CSV_DIR to the folder with libri2mix_{train-100,dev,test}.csv}
+CSV=${CSV_DIR:?set CSV_DIR to the folder with the libri2mix CSVs}
 RESULTS=${RESULTS:-$REPO/results}
 PYTHON=${PYTHON:-python}
 EPOCHS=${EPOCHS:-20}
