@@ -83,6 +83,6 @@ for step in range(int(os.environ.get("STEPS", "3"))):
         f"step {step}: waveform {float(loss):.3f} "
         f"jepa {float(separator.last_source_prediction_loss):.3f}"
     )
-print("health:", separator._health)
+print("health:", separator._health, "jepa-weight:", separator._last_jepa_weight)
 if torch.cuda.is_available():
     print("peak GPU GB:", torch.cuda.max_memory_allocated() / 1e9)

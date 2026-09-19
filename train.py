@@ -68,6 +68,7 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         self.jepa_mode = self.hparams.jepa_mode
         if self.jepa_mode not in ("none", "pointwise", "masked"):
             raise ValueError("jepa_mode must be none, pointwise or masked")
+        self._jepa_ratio_ema = None
         self._freeze_target_encoder()
         self._reset_training_metrics()
 
@@ -85,6 +86,7 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         self._optimizer_steps = 0
         self._skipped_optimizer_steps = 0
         self._health = None
+        self._last_jepa_weight = None
 
     def save_results(self, test_data):
         """Save one set of separation metrics for every test utterance.
@@ -208,6 +210,11 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
             "optimizer-steps": self._optimizer_steps,
             "skipped-optimizer-steps": self._skipped_optimizer_steps,
             **(self._health or {}),
+            **(
+                {"jepa-weight": self._last_jepa_weight}
+                if self._last_jepa_weight is not None
+                else {}
+            ),
         }
 
     def on_stage_start(self, stage, epoch=None):
@@ -499,10 +506,48 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
                 aligned_latents, clean_latents, valid_frames
             )
 
-        total_loss = waveform_loss + (
-            self.hparams.source_prediction_weight * source_prediction_loss
-        )
+        weight = self._jepa_weight(waveform_loss, source_prediction_loss)
+        total_loss = waveform_loss + weight * source_prediction_loss
         return total_loss, waveform_loss, source_prediction_loss
+
+    def _jepa_weight(self, waveform_loss, source_prediction_loss):
+        """Fixed or gradient-balanced weight of the JEPA loss.
+
+        With ``adaptive_jepa_weight`` the weight is chosen so that the JEPA
+        gradient on the last MaskNet layer has ``source_prediction_weight``
+        times the norm of the waveform gradient (adaptive weight as in VQGAN,
+        Esser et al., CVPR 2021). Without it the raw JEPA gradient reaching
+        the separator is ~1e-5..1e-3 of the SI-SNR gradient.
+        """
+        if not (
+            self.hparams.adaptive_jepa_weight
+            and self.modules.masknet.training
+            and torch.is_grad_enabled()
+        ):
+            return self.hparams.source_prediction_weight
+
+        masknet = getattr(self.modules.masknet, "module", self.modules.masknet)
+        probe = masknet.end_conv1x1.weight
+        scale = self.scaler.get_scale() if self.scaler.is_enabled() else 1.0
+        wave_grad = torch.autograd.grad(
+            waveform_loss.mean() * scale, probe, retain_graph=True
+        )[0]
+        jepa_grad = torch.autograd.grad(
+            source_prediction_loss.mean() * scale, probe, retain_graph=True
+        )[0]
+        ratio = wave_grad.float().norm() / (jepa_grad.float().norm() + 1e-12)
+        if torch.isfinite(ratio):
+            ratio = ratio.clamp(max=self.hparams.max_jepa_weight_ratio).item()
+            if self._jepa_ratio_ema is None:
+                self._jepa_ratio_ema = ratio
+            else:
+                self._jepa_ratio_ema = 0.99 * self._jepa_ratio_ema + 0.01 * ratio
+        if self._jepa_ratio_ema is None:
+            return self.hparams.source_prediction_weight
+        self._last_jepa_weight = (
+            self.hparams.source_prediction_weight * self._jepa_ratio_ema
+        )
+        return self._last_jepa_weight
 
     def _masked_prediction_loss(self, aligned_latents, clean_latents,
                                 valid_frames):
