@@ -15,9 +15,7 @@ from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SPEECHBRAIN_ROOT = Path(
-    os.environ.get("SPEECHBRAIN_ROOT", PROJECT_ROOT / "speechbrain")
-)
+SPEECHBRAIN_ROOT = PROJECT_ROOT / "speechbrain"
 BASE_RECIPE_DIR = SPEECHBRAIN_ROOT / "recipes" / "LibriMix" / "separation"
 
 sys.path.insert(0, str(SPEECHBRAIN_ROOT))
@@ -27,9 +25,6 @@ import speechbrain as sb  # noqa: E402
 from speechbrain.nnet.losses import PitWrapper, cal_si_snr  # noqa: E402
 from speechbrain.utils.distributed import run_on_main  # noqa: E402
 from speechbrain.utils.logger import get_logger  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from models import embedding_health, ema_momentum, sample_span_mask  # noqa: E402
 
 
 def _load_baseline_recipe():
@@ -62,18 +57,8 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         momentum = self.hparams.target_encoder_momentum
         if not 0.0 <= momentum < 1.0:
             raise ValueError("target_encoder_momentum must be in [0, 1)")
-        self.jepa_mode = self.hparams.jepa_mode
-        if self.jepa_mode not in ("none", "pointwise", "masked"):
-            raise ValueError("jepa_mode must be none, pointwise or masked")
         self._freeze_target_encoder()
         self._reset_training_metrics()
-
-    def _ema_pairs(self):
-        """(online, target) module pairs updated by EMA."""
-        pairs = [("encoder", "target_encoder")]
-        if self.jepa_mode == "masked":
-            pairs.append(("context_encoder", "target_context_encoder"))
-        return pairs
 
     def _reset_training_metrics(self):
         self._source_loss_sum = 0.0
@@ -81,7 +66,6 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         self._metric_item_count = 0
         self._optimizer_steps = 0
         self._skipped_optimizer_steps = 0
-        self._health = None
 
     def save_results(self, test_data):
         """Save one set of separation metrics for every test utterance.
@@ -204,135 +188,51 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
             "total-loss": self._total_loss_sum / count,
             "optimizer-steps": self._optimizer_steps,
             "skipped-optimizer-steps": self._skipped_optimizer_steps,
-            **(self._health or {}),
         }
 
     def on_stage_start(self, stage, epoch=None):
         super().on_stage_start(stage, epoch)
         if stage == sb.Stage.TRAIN:
             self._reset_training_metrics()
-        else:
-            self._sisnri_sum = 0.0
-            self._sisnri_count = 0
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
-        """Log SI-SNRi for validation and test without changing selection."""
-        stage_stats = {"si-snr": stage_loss}
+        super().on_stage_end(stage, stage_loss, epoch)
         if stage == sb.Stage.TRAIN:
-            self.train_stats = stage_stats
             self.train_stats.update(self._training_metric_stats())
-            return
-
-        # ``compute_objectives`` is a negative SI-SNR loss, hence the
-        # improvement is baseline_loss - estimated_loss.
-        stage_stats["si-snri"] = self._sisnri_sum / max(1, self._sisnri_count)
-
-        if stage == sb.Stage.VALID:
-            if isinstance(
-                self.hparams.lr_scheduler,
-                baseline_recipe.schedulers.ReduceLROnPlateau,
-            ):
-                current_lr, next_lr = self.hparams.lr_scheduler(
-                    [self.optimizer], epoch, stage_loss
-                )
-                baseline_recipe.schedulers.update_learning_rate(
-                    self.optimizer, next_lr
-                )
-            else:
-                current_lr = self.hparams.optimizer.optim.param_groups[0]["lr"]
-
-            self.hparams.train_logger.log_stats(
-                stats_meta={"epoch": epoch, "lr": current_lr},
-                train_stats=self.train_stats,
-                valid_stats=stage_stats,
-            )
-            # Keep the existing SI-SNR criterion for checkpoint selection.
-            self.checkpointer.save_and_keep_only(
-                meta={"si-snr": stage_stats["si-snr"]}, min_keys=["si-snr"]
-            )
-        elif stage == sb.Stage.TEST:
-            self.hparams.train_logger.log_stats(
-                stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats=stage_stats,
-            )
-
-    def evaluate_batch(self, batch, stage):
-        """Evaluate a batch and accumulate SI-SNR improvement per utterance."""
-        if stage == sb.Stage.TRAIN:
-            return super().evaluate_batch(batch, stage)
-
-        mixture, _ = batch.mix_sig
-        targets = [batch.s1_sig, batch.s2_sig]
-        if self.hparams.num_spks == 3:
-            targets.append(batch.s3_sig)
-
-        with torch.no_grad():
-            predictions, targets = self.compute_forward(
-                batch.mix_sig, targets, stage
-            )
-            loss = self.compute_objectives(predictions, targets)
-            mixture_baseline = torch.stack(
-                [mixture] * self.hparams.num_spks, dim=-1
-            ).to(targets.device)
-            baseline_loss = self.compute_objectives(mixture_baseline, targets)
-
-        sisnri = (baseline_loss - loss).detach().reshape(-1)
-        self._sisnri_sum += sisnri.float().sum().item()
-        self._sisnri_count += sisnri.numel()
-
-        # Preserve the base recipe's optional audio export behavior.
-        if stage == sb.Stage.TEST and self.hparams.save_audio:
-            if hasattr(self.hparams, "n_audio_to_save"):
-                if self.hparams.n_audio_to_save > 0:
-                    self.save_audio(
-                        batch.id[0], batch.mix_sig, targets, predictions
-                    )
-                    self.hparams.n_audio_to_save -= 1
-            else:
-                self.save_audio(batch.id[0], batch.mix_sig, targets, predictions)
-        return loss.mean().detach()
 
     def _freeze_target_encoder(self):
-        for _, target_name in self._ema_pairs():
-            self.modules[target_name].requires_grad_(False)
-            self.modules[target_name].eval()
+        self.modules.target_encoder.requires_grad_(False)
+        self.modules.target_encoder.eval()
 
     def initialize_target_encoder(self):
-        """Initialize the frozen target networks from the online networks."""
-        for online_name, target_name in self._ema_pairs():
-            self.modules[target_name].load_state_dict(
-                self.modules[online_name].state_dict()
-            )
-        self._freeze_target_encoder()
-
-    def current_momentum(self):
-        return ema_momentum(
-            self.optimizer_step,
-            self.hparams.ema_anneal_steps,
-            self.hparams.target_encoder_momentum,
-            self.hparams.target_encoder_momentum_end,
+        """Initialize the frozen target encoder from the online encoder."""
+        self.modules.target_encoder.load_state_dict(
+            self.modules.encoder.state_dict()
         )
+        self._freeze_target_encoder()
 
     @torch.no_grad()
     def update_target_encoder(self):
-        """Update the JEPA target networks from the online networks by EMA."""
-        momentum = self.current_momentum()
-        for online_name, target_name in self._ema_pairs():
-            online = self.modules[online_name]
-            target = self.modules[target_name]
-            online = getattr(online, "module", online)
-            target = getattr(target, "module", target)
-            for target_parameter, online_parameter in zip(
-                target.parameters(), online.parameters()
-            ):
-                target_parameter.mul_(momentum).add_(
-                    online_parameter, alpha=1.0 - momentum
-                )
-            for target_buffer, online_buffer in zip(
-                target.buffers(), online.buffers()
-            ):
-                target_buffer.copy_(online_buffer)
-            target.eval()
+        """Update the JEPA target encoder from the online encoder by EMA."""
+        online_encoder = self.modules.encoder
+        target_encoder = self.modules.target_encoder
+        if hasattr(online_encoder, "module"):
+            online_encoder = online_encoder.module
+        if hasattr(target_encoder, "module"):
+            target_encoder = target_encoder.module
+
+        momentum = self.hparams.target_encoder_momentum
+        for target_parameter, online_parameter in zip(
+            target_encoder.parameters(), online_encoder.parameters()
+        ):
+            target_parameter.mul_(momentum).add_(
+                online_parameter, alpha=1.0 - momentum
+            )
+        for target_buffer, online_buffer in zip(
+            target_encoder.buffers(), online_encoder.buffers()
+        ):
+            target_buffer.copy_(online_buffer)
+        target_encoder.eval()
 
     def _prepare_training_inputs(self, mix, targets, stage, noise=None):
         mix, mix_lens = mix
@@ -475,78 +375,22 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         waveform_loss, permutations = self.pit_si_snr(
             estimated_sources, targets
         )
-        if self.jepa_mode == "none":
-            return waveform_loss, waveform_loss, torch.zeros_like(waveform_loss)
 
         latents_for_reordering = separated_latents.permute(0, 2, 3, 1)
         aligned_latents = self.pit_si_snr.reorder_tensor(
             latents_for_reordering, permutations
         ).permute(0, 3, 1, 2)
-        if self.jepa_mode == "pointwise":
-            predicted_clean_latents = self.modules.source_predictor(
-                aligned_latents
-            )
-            source_prediction_loss = self.hparams.source_prediction_loss(
-                predicted_clean_latents,
-                clean_latents,
-                valid_frames,
-            )
-        else:
-            source_prediction_loss = self._masked_prediction_loss(
-                aligned_latents, clean_latents, valid_frames
-            )
+        predicted_clean_latents = self.modules.source_predictor(aligned_latents)
+        source_prediction_loss = self.hparams.source_prediction_loss(
+            predicted_clean_latents,
+            clean_latents,
+            valid_frames,
+        )
 
         total_loss = waveform_loss + (
             self.hparams.source_prediction_weight * source_prediction_loss
         )
         return total_loss, waveform_loss, source_prediction_loss
-
-    def _masked_prediction_loss(self, aligned_latents, clean_latents,
-                                valid_frames):
-        """JEPA v2: predict contextual clean-source embeddings of masked spans.
-
-        Online: PIT-aligned separated latents -> span masking (frames zeroed)
-        -> context encoder -> predictor with mask tokens.
-        Target: EMA(encoder) on clean sources -> EMA(context encoder).
-        """
-        batch, sources, channels, frames = aligned_latents.shape
-        flat = aligned_latents.reshape(batch * sources, channels, frames)
-        frame_mask = sample_span_mask(
-            batch * sources,
-            frames,
-            self.hparams.mask_ratio,
-            self.hparams.mask_span,
-            flat.device,
-        )
-        visible = flat * (~frame_mask).unsqueeze(1).to(flat.dtype)
-        context = self.modules.context_encoder(visible)
-        predictions = self.modules.span_predictor(context, frame_mask)
-        predictions = predictions.reshape(batch, sources, channels, frames)
-
-        with torch.no_grad():
-            self.modules.target_context_encoder.eval()
-            targets = self.modules.target_context_encoder(
-                clean_latents.reshape(batch * sources, channels, frames)
-            ).reshape(batch, sources, channels, frames)
-
-        frame_index = torch.arange(frames, device=flat.device)
-        valid = frame_index.unsqueeze(0) < valid_frames.to(flat.device).unsqueeze(1)
-        active = clean_latents.detach().float().norm(dim=2) > 1e-4
-        weight = frame_mask.reshape(batch, sources, frames).float()
-        weight = weight + self.hparams.visible_loss_weight * (1 - weight)
-        weight = weight * (valid.unsqueeze(1) & active).float()
-
-        if self.step % self.hparams.health_interval == 0:
-            pred_std, pred_rank = embedding_health(predictions)
-            tgt_std, tgt_rank = embedding_health(targets)
-            self._health = {
-                "pred-std": pred_std,
-                "pred-rank": pred_rank,
-                "target-std": tgt_std,
-                "target-rank": tgt_rank,
-                "ema-momentum": self.current_momentum(),
-            }
-        return self.hparams.masked_prediction_loss(predictions, targets, weight)
 
     def fit_batch(self, batch):
         """Train one batch and exclude already-solved waveform examples."""
@@ -613,7 +457,6 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
                 self._skipped_optimizer_steps += 1
             else:
                 self._optimizer_steps += 1
-                self.optimizer_step += 1
                 self.update_target_encoder()
         else:
             self._skipped_optimizer_steps += 1
@@ -630,8 +473,9 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
 def _load_libri_preparation():
     # Old external path:
     # /project/anhlt/lab-ss/LongHorn-TasNet-Libri/utils/prepare_data_libri.py
-    # Resolve ./prepare_data_libri.py relative to this file, not the shell cwd.
-    prep_path = Path(__file__).resolve().parent / "prepare_data_libri.py"
+    prep_path = Path(
+        "/project/anhlt/0607/research/source_predictive_sepformer/prepare_data_libri.py"
+    )
     spec = importlib.util.spec_from_file_location(
         "longhorn_librimix_preparation", prep_path
     )
@@ -642,62 +486,23 @@ def _load_libri_preparation():
     return module
 
 
-def _load_lrs2_preparation():
-    """Load the CSV preparation utilities for the LRS2 mixture dataset."""
-    prep_path = Path(__file__).resolve().parent / "prepare_data_lrs2.py"
-    spec = importlib.util.spec_from_file_location(
-        "lrs2_preparation", prep_path
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load LRS2 preparation from {prep_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def _prepare_datasets(hparams):
-    # With skip_prep the CSVs already exist (e.g. from tools/make_libri2mix.py).
-    if hparams["skip_prep"] and not hparams["dynamic_mixing"]:
-        return baseline_recipe.dataio_prep(hparams)
-    type_data = str(hparams.get("type_data", "libri2mix")).lower()
+    libri_preparation = _load_libri_preparation()
 
-    if type_data in {"libri", "librimix", "libri2mix"}:
-        data_preparation = _load_libri_preparation()
-        preparation_kwargs = {
+    run_on_main(
+        libri_preparation.prepare_wsjmix,
+        kwargs={
             "datapath": hparams["data_folder"],
             "savepath": hparams["save_folder"],
             "n_spks": hparams["num_spks"],
             "skip_prep": hparams["skip_prep"],
             "librimix_addnoise": hparams["use_wham_noise"],
             "fs": hparams["sample_rate"],
-        }
-    elif type_data == "lrs2":
-        data_preparation = _load_lrs2_preparation()
-        preparation_kwargs = {
-            "datapath": hparams["data_folder"],
-            "savepath": hparams["save_folder"],
-            "n_spks": hparams["num_spks"],
-            "skip_prep": hparams["skip_prep"],
-        }
-    else:
-        raise ValueError(
-            "Unsupported type_data={!r}. Expected one of: "
-            "libri2mix, librimix, libri, lrs2.".format(type_data)
-        )
-
-    run_on_main(
-        data_preparation.prepare_wsjmix,
-        kwargs=preparation_kwargs,
+        },
     )
 
     if not hparams["dynamic_mixing"]:
         return baseline_recipe.dataio_prep(hparams)
-
-    if type_data == "lrs2":
-        raise ValueError(
-            "dynamic_mixing is currently supported only for LibriMix "
-            f"datasets, not {type_data!r}"
-        )
 
     from dynamic_mixing import dynamic_mix_data_prep_librimix
 
@@ -771,8 +576,7 @@ def main():
         checkpointer=hparams["checkpointer"],
     )
 
-    # Mamba layers rely on their own dt/A initialization, so they are not reset.
-    if "pretrained_separator" not in hparams and hparams["seq_model"] != "mamba":
+    if "pretrained_separator" not in hparams:
         for module in separator.modules.values():
             separator.reset_layer_recursively(module)
 

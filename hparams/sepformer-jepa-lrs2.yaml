@@ -1,44 +1,36 @@
-# Source-predictive SepFormer for blind two-speaker Libri2Mix separation.
+# Source-predictive SepFormer for two-speaker LRS2 separation.
 # The clean-source encoder and predictor are training-only modules.
 
 seed: 1234
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 
-data_folder: /project/anhlt/LibriMix/Libri2Mix
-type_data: libri2mix
+data_folder: /project/anhlt/lab-ss/LRS2-2mix/lrs2_rebuild/audio
+type_data: lrs2
 base_folder_dm: /project/anhlt/LibriMix/LibriSpeech/train-clean-100/
 
-# Ablation switches (override from CLI, e.g. --seq_model=transformer --jepa_mode=none)
-#   seq_model: transformer | mamba
-#   jepa_mode: none | pointwise (v1) | masked (v2)
-seq_model: mamba
-jepa_mode: masked
-# JEPA head (context encoder, EMA target, predictor) is training-only and
-# discarded at inference; it is kept fixed across backbones for a fair ablation.
-jepa_head_model: mamba
-experiment_name: !ref jepa2-<seq_model>-<jepa_mode>-libri2mix
+experiment_name: sepformer-jepa-lrs2
 output_folder: !ref results/<experiment_name>-train100/<seed>
 train_log: !ref <output_folder>/train_log.txt
 save_folder: !ref <output_folder>/save
-train_data: !ref <save_folder>/libri2mix_train-100.csv
-valid_data: !ref <save_folder>/libri2mix_dev.csv
-test_data: !ref <save_folder>/libri2mix_test.csv
+train_data: !ref <save_folder>/lrs2_tr.csv
+valid_data: !ref <save_folder>/lrs2_cv.csv
+test_data: !ref <save_folder>/lrs2_tt.csv
 skip_prep: False
 ckpt_interval_minutes: 60
 
-precision: fp16
+precision: fp32
 num_spks: 2
 noprogressbar: False
 save_audio: False
 sample_rate: 8000
 
 N_epochs: 200
-batch_size: 2
+batch_size: 3
 lr: 0.00015
 clip_grad_norm: 5
 loss_upper_lim: 999999
 limit_training_signal_len: True
-training_signal_len: 72000
+training_signal_len: 32000
 
 dynamic_mixing: False
 use_wham_noise: False
@@ -87,19 +79,7 @@ kernel_stride: 8
 d_ffn: 1024
 predictor_hidden_channels: 256
 source_prediction_weight: 0.1
-sep_layers: 8
-# EMA: cosine schedule from start to end over ema_anneal_steps optimizer steps
-target_encoder_momentum: 0.996
-target_encoder_momentum_end: 1.0
-ema_anneal_steps: 2800000  # ~ N_epochs * (13900 / batch_size) for train-100
-# JEPA v2 (masked) settings
-context_layers: 2
-predictor_dim: 128
-predictor_layers: 2
-mask_ratio: 0.5
-mask_span: 10  # latent frames; 10 frames * 8 samples = 10 ms @ 8 kHz
-visible_loss_weight: 0.0
-health_interval: 200
+target_encoder_momentum: 0.999
 
 dataloader_opts:
     batch_size: !ref <batch_size>
@@ -113,17 +93,23 @@ TargetEncoder: !new:speechbrain.lobes.models.dual_path.Encoder
     kernel_size: !ref <kernel_size>
     out_channels: !ref <N_encoder_out>
 
-SBtfintra: !apply:models.build_sequence_model
-    kind: !ref <seq_model>
-    num_layers: !ref <sep_layers>
+SBtfintra: !new:speechbrain.lobes.models.dual_path.SBTransformerBlock
+    num_layers: 8
     d_model: !ref <out_channels>
+    nhead: 8
     d_ffn: !ref <d_ffn>
+    dropout: 0
+    use_positional_encoding: True
+    norm_before: True
 
-SBtfinter: !apply:models.build_sequence_model
-    kind: !ref <seq_model>
-    num_layers: !ref <sep_layers>
+SBtfinter: !new:speechbrain.lobes.models.dual_path.SBTransformerBlock
+    num_layers: 8
     d_model: !ref <out_channels>
+    nhead: 8
     d_ffn: !ref <d_ffn>
+    dropout: 0
+    use_positional_encoding: True
+    norm_before: True
 
 MaskNet: !new:speechbrain.lobes.models.dual_path.Dual_Path_Model
     num_spks: !ref <num_spks>
@@ -150,33 +136,6 @@ SourcePredictor: !new:models.SourceLatentPredictor
 
 source_prediction_loss: !new:models.NormalizedSourcePredictionLoss
 
-ContextEncoder: !new:models.SequenceContextEncoder
-    sequence_model: !apply:models.build_sequence_model
-        kind: !ref <jepa_head_model>
-        num_layers: !ref <context_layers>
-        d_model: !ref <N_encoder_out>
-        d_ffn: !ref <d_ffn>
-
-TargetContextEncoder: !new:models.SequenceContextEncoder
-    sequence_model: !apply:models.build_sequence_model
-        kind: !ref <jepa_head_model>
-        num_layers: !ref <context_layers>
-        d_model: !ref <N_encoder_out>
-        d_ffn: !ref <d_ffn>
-
-SpanPredictor: !new:models.MaskedSpanPredictor
-    channels: !ref <N_encoder_out>
-    predictor_dim: !ref <predictor_dim>
-    sequence_model: !apply:models.build_sequence_model
-        kind: !ref <jepa_head_model>
-        num_layers: !ref <predictor_layers>
-        d_model: !ref <predictor_dim>
-        d_ffn: 512
-        nhead: 4
-
-masked_prediction_loss: !new:models.MaskedLatentPredictionLoss
-    kind: l2
-
 optimizer: !name:torch.optim.Adam
     lr: !ref <lr>
     weight_decay: 0
@@ -197,9 +156,6 @@ modules:
     masknet: !ref <MaskNet>
     source_predictor: !ref <SourcePredictor>
     target_encoder: !ref <TargetEncoder>
-    context_encoder: !ref <ContextEncoder>
-    target_context_encoder: !ref <TargetContextEncoder>
-    span_predictor: !ref <SpanPredictor>
 
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
@@ -209,9 +165,6 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
         masknet: !ref <MaskNet>
         source_predictor: !ref <SourcePredictor>
         target_encoder: !ref <TargetEncoder>
-        context_encoder: !ref <ContextEncoder>
-        target_context_encoder: !ref <TargetContextEncoder>
-        span_predictor: !ref <SpanPredictor>
         lr_scheduler: !ref <lr_scheduler>
         counter: !ref <epoch_counter>
 
