@@ -4,7 +4,7 @@
 Example:
   SEQ=mamba MODE=masked L=4 LEN=32000 PREC=fp16 python tools/smoke_test.py
 Env: SEQ (transformer|mamba), MODE (none|pointwise|masked), L (sep layers),
-LEN (samples), STEPS, PREC (fp32|fp16), DEV, OUT.
+LEN (samples), STEPS, PREC (fp32|fp16), DEV, OUT, EXTRA (k=v,...).
 """
 
 import os
@@ -34,6 +34,12 @@ overrides = {
     "threshold_byloss": False,
     "health_interval": 1,
 }
+# EXTRA="n_dp=8,skip_around_intra=False" -> extra YAML overrides
+for item in filter(None, os.environ.get("EXTRA", "").split(",")):
+    key, value = item.split("=")
+    overrides[key] = {"True": True, "False": False}.get(
+        value, int(value) if value.isdigit() else value
+    )
 with open("hparams/jepa2-libri2mix.yaml", encoding="utf-8") as stream:
     hparams = load_hyperpyyaml(stream, overrides)
 

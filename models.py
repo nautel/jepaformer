@@ -322,9 +322,55 @@ def embedding_health(embeddings, max_frames=4096):
     return std, rank
 
 
+def _official_dpmamba_block(num_layers, d_model, d_state):
+    """Official DPMamba intra/inter block from github.com/xi-j/Mamba-TasNet.
+
+    The repository (GPL-3.0) is not vendored: clone it and point
+    ``MAMBA_TASNET_ROOT`` to it (default: ``third_party/Mamba-TasNet``).
+    Config follows ``hparams/WSJ0Mix/dpmamba_*.yaml`` (bidirectional v2,
+    RMSNorm, no fused add-norm).
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    root = Path(
+        os.environ.get(
+            "MAMBA_TASNET_ROOT",
+            Path(__file__).resolve().parent / "third_party" / "Mamba-TasNet",
+        )
+    )
+    if not (root / "modules" / "mamba_blocks.py").exists():
+        raise ImportError(
+            f"Mamba-TasNet not found at {root}; clone "
+            "https://github.com/xi-j/Mamba-TasNet and set MAMBA_TASNET_ROOT"
+        )
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from modules.mamba_blocks import MambaBlocksSequential
+
+    return MambaBlocksSequential(
+        n_mamba=num_layers,
+        bidirectional=True,
+        d_model=d_model,
+        d_state=d_state,
+        expand=2,
+        d_conv=4,
+        fused_add_norm=False,
+        rms_norm=True,
+        residual_in_fp32=False,
+    )
+
+
 def build_sequence_model(kind, num_layers, d_model, d_ffn, nhead=8,
                          d_state=16, causal=False):
-    """Build a ``[B, L, N]`` sequence model: ``'transformer'`` or ``'mamba'``."""
+    """Build a ``[B, L, N]`` sequence model.
+
+    ``kind``: ``'transformer'`` (SepFormer block), ``'mamba'`` (our BiMamba
+    layers with FFN) or ``'dpmamba'`` (official DPMamba block).
+    """
+    if kind == "dpmamba":
+        return _official_dpmamba_block(num_layers, d_model, d_state)
     if kind == "mamba":
         return BiMambaBlock(num_layers, d_model, d_ffn, d_state=d_state,
                             causal=causal)

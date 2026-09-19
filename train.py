@@ -775,7 +775,10 @@ def main():
     )
 
     # Mamba layers rely on their own dt/A initialization, so they are not reset.
-    if "pretrained_separator" not in hparams and hparams["seq_model"] != "mamba":
+    if "pretrained_separator" not in hparams and hparams["seq_model"] not in (
+        "mamba",
+        "dpmamba",
+    ):
         for module in separator.modules.values():
             separator.reset_layer_recursively(module)
 
