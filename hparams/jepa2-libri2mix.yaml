@@ -91,6 +91,7 @@ source_prediction_weight: 0.1
 # ||grad SI-SNR|| on MaskNet's last layer (weight set adaptively per step).
 adaptive_jepa_weight: True
 max_jepa_weight_ratio: 100000
+jepa_weight_interval: 20  # recompute the adaptive weight every N steps
 sep_layers: 8
 # dual-path blocks in MaskNet; DPMamba-S = n_dp 8 + sep_layers 1 +
 # skip_around_intra False, DPMamba-M = n_dp 16
@@ -104,6 +105,10 @@ ema_anneal_steps: 2800000  # ~ N_epochs * (13900 / batch_size) for train-100
 context_layers: 2
 predictor_dim: 128
 predictor_layers: 2
+# clean = predict clean-source embeddings; mixture_sum = predict the mixture
+# embedding from the summed source predictions (no clean reference needed)
+jepa_target: clean
+jepa_loss_kind: l2  # l2 | cosine | infonce (CPC-style baseline)
 mask_ratio: 0.5
 mask_span: 10  # latent frames; 10 frames * 8 samples = 10 ms @ 8 kHz
 visible_loss_weight: 0.0
@@ -183,7 +188,7 @@ SpanPredictor: !new:models.MaskedSpanPredictor
         nhead: 4
 
 masked_prediction_loss: !new:models.MaskedLatentPredictionLoss
-    kind: l2
+    kind: !ref <jepa_loss_kind>
 
 optimizer: !name:torch.optim.Adam
     lr: !ref <lr>

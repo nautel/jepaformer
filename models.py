@@ -275,20 +275,25 @@ class MaskedLatentPredictionLoss(nn.Module):
     """Loss on masked frames between predictions and layer-normed targets.
 
     ``kind='l2'`` follows I-JEPA (MSE to LayerNorm-ed targets);
-    ``kind='cosine'`` reuses the v1 frame-wise cosine distance.
+    ``kind='cosine'`` reuses the v1 frame-wise cosine distance;
+    ``kind='infonce'`` is the contrastive alternative (CPC / pSkiM style),
+    with the other masked frames of the batch as negatives.
     """
 
-    def __init__(self, kind="l2", eps=1e-4):
+    def __init__(self, kind="l2", eps=1e-4, temperature=0.1):
         super().__init__()
-        if kind not in ("l2", "cosine"):
-            raise ValueError("kind must be 'l2' or 'cosine'")
+        if kind not in ("l2", "cosine", "infonce"):
+            raise ValueError("kind must be 'l2', 'cosine' or 'infonce'")
         self.kind = kind
         self.eps = eps
+        self.temperature = temperature
 
     def forward(self, predictions, targets, weight_mask):
         """Shapes ``[B, S, C, T]`` and ``weight_mask`` ``[B, S, T]``."""
         predictions = predictions.float()
         targets = targets.detach().float()
+        if self.kind == "infonce":
+            return self._infonce(predictions, targets, weight_mask)
         if self.kind == "l2":
             targets = F.layer_norm(targets.transpose(2, 3), (targets.shape[2],))
             targets = targets.transpose(2, 3)
@@ -301,6 +306,32 @@ class MaskedLatentPredictionLoss(nn.Module):
         weight_mask = weight_mask.float()
         summed = (frame_loss * weight_mask).sum(dim=(1, 2))
         return summed / weight_mask.sum(dim=(1, 2)).clamp_min(1)
+
+
+    def _infonce(self, predictions, targets, weight_mask):
+        """Frame-level InfoNCE inside each batch item (CPC-style baseline)."""
+        batch, sources, channels, frames = predictions.shape
+        query = F.normalize(
+            predictions.permute(0, 1, 3, 2).reshape(batch, -1, channels),
+            dim=-1,
+            eps=self.eps,
+        )
+        key = F.normalize(
+            targets.permute(0, 1, 3, 2).reshape(batch, -1, channels),
+            dim=-1,
+            eps=self.eps,
+        )
+        logits = torch.bmm(query, key.transpose(1, 2)) / self.temperature
+        labels = torch.arange(logits.shape[1], device=logits.device)
+        frame_loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            labels.repeat(batch),
+            reduction="none",
+        ).reshape(batch, sources, frames)
+        weight_mask = weight_mask.float()
+        return (frame_loss * weight_mask).sum(dim=(1, 2)) / weight_mask.sum(
+            dim=(1, 2)
+        ).clamp_min(1)
 
 
 @torch.no_grad()

@@ -471,6 +471,7 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
             separated_latents,
             clean_latents,
             valid_frames,
+            mix,
         )
 
     def compute_training_objectives(
@@ -480,6 +481,7 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         separated_latents,
         clean_latents,
         valid_frames,
+        mixture,
     ):
         """Compute waveform PIT and source prediction with one assignment."""
         waveform_loss, permutations = self.pit_si_snr(
@@ -503,7 +505,7 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
             )
         else:
             source_prediction_loss = self._masked_prediction_loss(
-                aligned_latents, clean_latents, valid_frames
+                aligned_latents, clean_latents, valid_frames, mixture
             )
 
         weight = self._jepa_weight(waveform_loss, source_prediction_loss)
@@ -526,6 +528,13 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         ):
             return self.hparams.source_prediction_weight
 
+        interval = self.hparams.jepa_weight_interval
+        if self._jepa_ratio_ema is not None and self.step % interval != 0:
+            self._last_jepa_weight = (
+                self.hparams.source_prediction_weight * self._jepa_ratio_ema
+            )
+            return self._last_jepa_weight
+
         masknet = getattr(self.modules.masknet, "module", self.modules.masknet)
         probe = masknet.end_conv1x1.weight
         scale = self.scaler.get_scale() if self.scaler.is_enabled() else 1.0
@@ -541,7 +550,10 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
             if self._jepa_ratio_ema is None:
                 self._jepa_ratio_ema = ratio
             else:
-                self._jepa_ratio_ema = 0.99 * self._jepa_ratio_ema + 0.01 * ratio
+                decay = 0.99 ** self.hparams.jepa_weight_interval
+                self._jepa_ratio_ema = (
+                    decay * self._jepa_ratio_ema + (1 - decay) * ratio
+                )
         if self._jepa_ratio_ema is None:
             return self.hparams.source_prediction_weight
         self._last_jepa_weight = (
@@ -550,22 +562,29 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
         return self._last_jepa_weight
 
     def _masked_prediction_loss(self, aligned_latents, clean_latents,
-                                valid_frames):
-        """JEPA v2: predict contextual clean-source embeddings of masked spans.
+                                valid_frames, mixture):
+        """JEPA v2: predict contextual embeddings of masked spans.
 
         Online: PIT-aligned separated latents -> span masking (frames zeroed)
         -> context encoder -> predictor with mask tokens.
-        Target: EMA(encoder) on clean sources -> EMA(context encoder).
+        Target (``jepa_target``):
+        ``clean``       EMA(encoder + context encoder) on the clean sources;
+        ``mixture_sum`` EMA(...) on the mixture, matched by the sum of the
+                        predicted source embeddings (needs no clean reference,
+                        so the same objective works on unlabelled mixtures).
         """
         batch, sources, channels, frames = aligned_latents.shape
         flat = aligned_latents.reshape(batch * sources, channels, frames)
+        # mixture_sum compares a per-item sum, so all sources share one mask
         frame_mask = sample_span_mask(
-            batch * sources,
+            batch if self.hparams.jepa_target == "mixture_sum" else batch * sources,
             frames,
             self.hparams.mask_ratio,
             self.hparams.mask_span,
             flat.device,
         )
+        if self.hparams.jepa_target == "mixture_sum":
+            frame_mask = frame_mask.repeat_interleave(sources, dim=0)
         visible = flat * (~frame_mask).unsqueeze(1).to(flat.dtype)
         context = self.modules.context_encoder(visible)
         predictions = self.modules.span_predictor(context, frame_mask)
@@ -573,14 +592,28 @@ class SourcePredictiveSeparation(baseline_recipe.Separation):
 
         with torch.no_grad():
             self.modules.target_context_encoder.eval()
-            targets = self.modules.target_context_encoder(
-                clean_latents.reshape(batch * sources, channels, frames)
-            ).reshape(batch, sources, channels, frames)
+            if self.hparams.jepa_target == "mixture_sum":
+                mixture_latent = self.modules.target_encoder(mixture)
+                targets = self.modules.target_context_encoder(
+                    mixture_latent
+                ).unsqueeze(1)
+            else:
+                targets = self.modules.target_context_encoder(
+                    clean_latents.reshape(batch * sources, channels, frames)
+                ).reshape(batch, sources, channels, frames)
+
+        if self.hparams.jepa_target == "mixture_sum":
+            # sum of source predictions must reconstruct the mixture embedding
+            predictions = predictions.sum(dim=1, keepdim=True)
 
         frame_index = torch.arange(frames, device=flat.device)
         valid = frame_index.unsqueeze(0) < valid_frames.to(flat.device).unsqueeze(1)
         active = clean_latents.detach().float().norm(dim=2) > 1e-4
-        weight = frame_mask.reshape(batch, sources, frames).float()
+        if self.hparams.jepa_target == "mixture_sum":
+            active = active.any(dim=1, keepdim=True)
+        weight = frame_mask.reshape(batch, sources, frames)[
+            :, : targets.shape[1]
+        ].float()
         weight = weight + self.hparams.visible_loss_weight * (1 - weight)
         weight = weight * (valid.unsqueeze(1) & active).float()
 
