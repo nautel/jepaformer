@@ -25,7 +25,7 @@ in_window() {
     [ "$h" -ge "$START_H" ] || [ "$h" -lt "$END_H" ]
   fi
 }
-mine() { pgrep -u "$USER" -f "hparams/jepa2-libri2mix.yaml" | wc -l; }
+mine() { pgrep -u "$USER" -f "train[.]py hparams/jepa2" | wc -l; }
 finished() {  # $1 = tag -> done when the log already has EPOCHS epochs
   local log="$RESULTS/pilot-$2-$3$1/train_log.txt"
   [ -f "$log" ] && [ "$(grep -c '^epoch:' "$log")" -ge "$EPOCHS" ]
@@ -61,4 +61,4 @@ while in_window; do
 done
 
 echo "$(date '+%F %T') window closed, stopping my jobs"
-pkill -u "$USER" -f "hparams/jepa2-libri2mix.yaml"
+pkill -u "$USER" -f "train[.]py hparams/jepa2"
