@@ -24,7 +24,7 @@ train_data: !ref <save_folder>/libri2mix_train-100.csv
 valid_data: !ref <save_folder>/libri2mix_dev.csv
 test_data: !ref <save_folder>/libri2mix_test.csv
 skip_prep: False
-ckpt_interval_minutes: 60
+ckpt_interval_minutes: 20  # keep resume loss small when jobs stop at 06:00
 
 precision: fp16
 num_spks: 2
