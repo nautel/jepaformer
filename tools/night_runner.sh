@@ -14,6 +14,7 @@ FREE_MB=${FREE_MB:-12000}
 START_H=${START_H:-0}
 END_H=${END_H:-6}
 EPOCHS=${EPOCHS:-20}
+USER=${USER:-$(id -un)}   # cron does not always export USER
 RESULTS=${RESULTS:-$REPO/results}
 mkdir -p "$REPO/logs"
 
